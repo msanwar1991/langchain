@@ -683,9 +683,50 @@ class RecursiveCharacterTextSplitter(TextSplitter):
             final_chunks.extend(merged_text)
         return final_chunks
 
-    def _split_text_with_metadata(self, text: str, separators: List[str]) -> List[str]:
+    # def create_documents(
+    #     self, texts: List[str], metadatas: Optional[List[dict]] = None
+    # ) -> List[Document]:
+    #     """Create documents from a list of texts."""
+    #     _metadatas = metadatas or [{}] * len(texts)
+    #     documents = []
+    #     for i, text in enumerate(texts):
+    #         index = -1
+    #         for chunk in self.split_text(text):
+    #             metadata = copy.deepcopy(_metadatas[i])
+    #             if self._add_start_index:
+    #                 index = text.find(chunk, index + 1)
+    #                 metadata["start_index"] = index
+    #             new_doc = Document(page_content=chunk, metadata=metadata)
+    #             documents.append(new_doc)
+    #     return documents
+
+    def _split_text_with_metadata(self, documents: Iterable[Document], separators: List[str] ) -> List[Document]:
         """Split incoming text and return chunks."""
+        
+        texts, page_nums = [], []
+        for doc in documents:
+            texts.append(doc.page_content)
+            
+            page_num = doc.metadata['page']
+            # convert page_num from int to str
+
+            page_nums.append(page_num)
+
+        
+        print("page_nums: ", page_nums)
+
+
+        input_texts = texts[0:2]
+
+        # join texts into one string
+        text = " ".join(input_texts)
+        # run _length_function on text
+        text_len = self._length_function(text)
+        print("input_text_len: ", text_len)
+
+
         final_chunks = []
+        chunks_metadata = []
         # Get appropriate separator to use
         separator = separators[-1]
         new_separators = []
@@ -700,29 +741,125 @@ class RecursiveCharacterTextSplitter(TextSplitter):
                 break
 
         _separator = separator if self._is_separator_regex else re.escape(separator)
-        splits = _split_text_with_regex(text, _separator, self._keep_separator)
+        
+        # iterate over input_text (enumerate) and split it
+        doc_splits = {}
+        for i, text in enumerate(input_texts):
+            splits = _split_text_with_regex(text, _separator, self._keep_separator)
+            page_num = page_nums[i]
+            doc_splits[page_num] = splits
+        
+    
+
+        # Test print
+        print("input text: ", text)
+        print("doc_splits: ", doc_splits)
+
+        # splits = doc_splits["100"]
 
         # Now go merging things, recursively splitting longer texts.
-        _good_splits = []
+        
         _separator = "" if self._keep_separator else separator
-        for s in splits:
-            if self._length_function(s) < self._chunk_size:
-                _good_splits.append(s)
-            else:
-                if _good_splits:
-                    merged_text = self._merge_splits(_good_splits, _separator)
-                    final_chunks.extend(merged_text)
-                    _good_splits = []
-                if not new_separators:
-                    final_chunks.append(s)
-                else:
-                    other_info = self._split_text(s, new_separators)
-                    final_chunks.extend(other_info)
-        if _good_splits:
-            merged_text = self._merge_splits(_good_splits, _separator)
+        
+        # Commenting out for now since good_splits only apply when chunk size really small
+
+        # good_splits = []
+
+        # for s in splits:
+        #     if self._length_function(s) < self._chunk_size:
+        #         _good_splits.append(s)
+        #     else:
+        #         if _good_splits:
+        #             merged_text = self._merge_splits_with_metadata(_good_splits, _separator)
+        #             final_chunks.extend(merged_text)
+        #             _good_splits = []
+        #         if not new_separators:
+        #             final_chunks.append(s)
+        #         else:
+        #             other_info = self._split_text(s, new_separators)
+        #             final_chunks.extend(other_info)
+
+        # print("Good Splits: " , _good_splits)
+        
+        # doc_splits = {'100': _good_splits}
+        if doc_splits:
+            merged_text, docs_metadata = self._merge_splits_with_metadata(doc_splits, _separator)
             final_chunks.extend(merged_text)
+            chunks_metadata.extend(docs_metadata)
+
+        print("final_chunks: ", final_chunks)
+        print("chunks_metadata: ", chunks_metadata)
         return final_chunks
     
+    def split_documents(self, documents: Iterable[Document]) -> List[Document]:
+        """Split documents."""
+        texts, metadatas = [], []
+        for doc in documents:
+            texts.append(doc.page_content)
+            metadatas.append(doc.metadata)
+        return self.create_documents(texts, metadatas=metadatas)
+
+    def _merge_splits_with_metadata(self, doc_splits: Dict[str, str], separator: str) -> Tuple[List[str], List[str]]:
+        # We now want to combine these smaller pieces into medium size
+        # chunks to send to the LLM.
+        separator_len = self._length_function(separator)
+
+        docs = []
+        docs_metadata = []
+
+        # splits = doc_splits['100']
+
+        current_doc: List[str] = []
+        total = 0
+        chunk_start_page_num = 100 # first page in doc_splits
+
+
+        # iterate over doc_splits with the keys sorted in ascending order
+        for page_num, splits in sorted(doc_splits.items(), key=lambda x: int(x[0])):
+            print("Processing page number: ", page_num)
+            for d in splits:
+                _len = self._length_function(d)
+                if (
+                    total + _len + (separator_len if len(current_doc) > 0 else 0)
+                    > self._chunk_size
+                ):
+                    if total > self._chunk_size:
+                        logger.warning(
+                            f"Created a chunk of size {total}, "
+                            f"which is longer than the specified {self._chunk_size}"
+                        )
+                    if len(current_doc) > 0:
+                        print("are you getting hit!?")
+                        doc = self._join_docs(current_doc, separator)
+                        if doc is not None:
+                            docs.append(doc)
+                            docs_metadata.append(chunk_start_page_num)
+                            chunk_start_page_num = page_num # setting chunk_start_page_num to current page_num
+                        # Keep on popping if:
+                        # - we have a larger chunk than in the chunk overlap
+                        # - or if we still have any chunks and the length is long
+                        while total > self._chunk_overlap or (
+                            total + _len + (separator_len if len(current_doc) > 0 else 0)
+                            > self._chunk_size
+                            and total > 0
+                        ):
+                            total -= self._length_function(current_doc[0]) + (
+                                separator_len if len(current_doc) > 1 else 0
+                            )
+                            current_doc = current_doc[1:]
+                current_doc.append(d)
+                total += _len + (separator_len if len(current_doc) > 1 else 0)
+        
+        
+        # for the last bit of text
+        doc = self._join_docs(current_doc, separator)
+        if doc is not None:
+            docs.append(doc)
+            docs_metadata.append(chunk_start_page_num)
+
+        return docs, docs_metadata
+    
+
     def split_text(self, text: str) -> List[str]:
         print("calling split_text function")
         return self._split_text(text, self._separators)
